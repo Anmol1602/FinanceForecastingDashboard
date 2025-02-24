@@ -1,3 +1,4 @@
+# Python development environment and IDE files
 venv/
 __pycache__/
 .vscode/
@@ -6,5 +7,5 @@ __pycache__/
 *.h5
 *.npy
 
-# Ignore CSV files (if they are generated data)
+# Ignore CSV files 
 *.csv
