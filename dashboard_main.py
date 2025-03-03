@@ -6,8 +6,7 @@ from tensorflow.keras.models import load_model
 from sklearn.preprocessing import MinMaxScaler
 import h5py
 from datetime import datetime, timedelta
-
-
+from sklearn.metrics import mean_squared_error, mean_absolute_error
 
 def load_models():
     """Load all three LSTM models"""
@@ -42,7 +41,7 @@ def load_scalers():
             scaler.data_max_ = params['data_max_']
             scaler.data_range_ = params['data_range_']
             scaler.feature_range = (0, 1)
-            scaler.n_features_in_ = 1
+            scaler.n_features_in_ = params['n_features_in_']
             scaler.n_samples_seen_ = params.get('n_samples_seen_', None)
             
         return stock_scaler, crypto_scaler, forex_scaler
@@ -53,78 +52,224 @@ def load_scalers():
 def load_predictions(asset_type):
     """Load predictions from HDF5 file"""
     try:
+        features = ['OPEN', 'HIGH', 'LOW', 'CLOSE', 'VOLUME']
         with h5py.File(f'{asset_type.lower()}_predictions.h5', 'r') as f:
-            predictions = np.array(f['predictions'])
             dates = pd.to_datetime([date.decode('ascii') for date in f['dates']])
-            actual = np.array(f['actual'])
             
-        pred_df = pd.DataFrame({
-            'actual': actual,
-            'predicted': predictions.flatten()
-        }, index=dates)
-        
+            pred_dict = {}
+            for feature in features:
+                if f'actual_{feature}' in f:
+                    pred_dict[f'actual_{feature}'] = np.array(f[f'actual_{feature}'])
+                if f'predictions_{feature}' in f:
+                    pred_dict[f'predicted_{feature}'] = np.array(f[f'predictions_{feature}'])
+            
+        pred_df = pd.DataFrame(pred_dict, index=dates)
         return pred_df
     except Exception as e:
         st.error(f"❌ Error loading predictions for {asset_type}: {e}")
         return None
 
 def predict_future(model, last_sequence, scaler):
-    """Generate future predictions"""
+    """Generate future predictions for multiple features"""
     future_predictions = []
     current_sequence = last_sequence.copy()
     
     for _ in range(30):  # Predict next 30 days
-        current_pred = model.predict(current_sequence.reshape(1, *current_sequence.shape))
-        future_predictions.append(scaler.inverse_transform(current_pred)[0,0])
-        current_sequence = np.roll(current_sequence, -1)
-        current_sequence[-1] = current_pred
+        scaled_pred = model.predict(current_sequence.reshape(1, *current_sequence.shape))
+        pred = scaler.inverse_transform(scaled_pred)[0]
+        future_predictions.append(pred)
+        current_sequence = np.roll(current_sequence, -1, axis=0)
+        current_sequence[-1] = scaled_pred
+    
+    return np.array(future_predictions)
 
-    return future_predictions
+def get_available_features(pred_df):
+    """Get list of available features from the prediction dataframe"""
+    features = set()
+    for column in pred_df.columns:
+        if column.startswith('actual_'):
+            features.add(column.replace('actual_', ''))
+    return sorted(list(features))
 
-def create_forecast_plot(historical_data, future_data, asset_type):
-    """Create interactive plot with historical and future data"""
+def create_multi_feature_plot(historical_data, future_data, asset_type, selected_features):
+    """Create interactive plot with multiple features"""
     fig = go.Figure()
-
-    # Historical actual values
-    fig.add_trace(go.Scatter(
-        x=historical_data.index,
-        y=historical_data['actual'],
-        name='Actual',
-        line=dict(color='blue')
-    ))
-
-    # Historical predictions
-    fig.add_trace(go.Scatter(
-        x=historical_data.index,
-        y=historical_data['predicted'],
-        name='Historical Predictions',
-        line=dict(color='green', dash='dash')
-    ))
-
-    # Future predictions
-    future_dates = pd.date_range(
-        start=historical_data.index[-1] + timedelta(days=1),
-        periods=len(future_data)
-    )
-    fig.add_trace(go.Scatter(
-        x=future_dates,
-        y=future_data,
-        name='Future Forecast',
-        line=dict(color='red', dash='dash')
-    ))
+    
+    # Add historical actual values for each selected feature
+    for feature in selected_features:
+        if f'actual_{feature}' in historical_data.columns:
+            fig.add_trace(go.Scatter(
+                x=historical_data.index,
+                y=historical_data[f'actual_{feature}'],
+                name=f'Actual {feature}',
+                line=dict(width=2)
+            ))
+            
+            # Add historical predictions if available
+            if f'predicted_{feature}' in historical_data.columns:
+                fig.add_trace(go.Scatter(
+                    x=historical_data.index,
+                    y=historical_data[f'predicted_{feature}'],
+                    name=f'Predicted {feature}',
+                    line=dict(dash='dash', width=2)
+                ))
+            
+            # Add future predictions
+            feature_idx = selected_features.index(feature)
+            if feature_idx < future_data.shape[1]:
+                future_dates = pd.date_range(
+                    start=historical_data.index[-1] + timedelta(days=1),
+                    periods=len(future_data)
+                )
+                fig.add_trace(go.Scatter(
+                    x=future_dates,
+                    y=future_data[:, feature_idx],
+                    name=f'Future {feature}',
+                    line=dict(dash='dot', width=2)
+                ))
 
     fig.update_layout(
-        title=f'{asset_type} Price Forecast',
+        title=f'{asset_type} Multi-Feature Forecast',
         xaxis_title='Date',
-        yaxis_title='Price',
+        yaxis_title='Value',
         hovermode='x unified',
-        template='plotly_white'
+        template='plotly_white',
+        legend=dict(
+            yanchor="top",
+            y=0.99,
+            xanchor="left",
+            x=0.01
+        )
     )
-
+    
     return fig
 
+def create_feature_correlation_plot(historical_data, features):
+    """Create correlation heatmap for features"""
+    correlation_data = {}
+    for feature in features:
+        correlation_data[feature] = historical_data[f'actual_{feature}']
+    
+    corr_matrix = pd.DataFrame(correlation_data).corr()
+    
+    fig = go.Figure(data=go.Heatmap(
+        z=corr_matrix,
+        x=features,
+        y=features,
+        colorscale='RdBu',
+        zmin=-1,
+        zmax=1,
+        text=np.round(corr_matrix, 2),
+        texttemplate='%{text}',
+        textfont={"size": 10},
+        hoverongaps=False
+    ))
+    
+    fig.update_layout(
+        title='Feature Correlation Matrix',
+        template='plotly_white'
+    )
+    
+    return fig
+
+def create_prediction_accuracy_plot(historical_data, features):
+    """Create prediction accuracy comparison plot"""
+    fig = go.Figure()
+    
+    for feature in features:
+        mse = mean_squared_error(
+            historical_data[f'actual_{feature}'],
+            historical_data[f'predicted_{feature}']
+        )
+        mae = mean_absolute_error(
+            historical_data[f'actual_{feature}'],
+            historical_data[f'predicted_{feature}']
+        )
+        
+        fig.add_trace(go.Bar(
+            name=feature,
+            x=['MSE', 'MAE'],
+            y=[mse, mae],
+            text=[f'{mse:.4f}', f'{mae:.4f}'],
+            textposition='auto',
+        ))
+    
+    fig.update_layout(
+        title='Prediction Accuracy Metrics by Feature',
+        barmode='group',
+        template='plotly_white'
+    )
+    
+    return fig
+
+def display_asset_analysis(tab, pred_df, predictions, asset_type, features):
+    """Display analysis for a specific asset type"""
+    # Get available features for this asset
+    available_features = get_available_features(pred_df)
+    
+    if not available_features:
+        st.error(f"No features found for {asset_type}")
+        return
+        
+    selected_features = st.multiselect(
+        "Select features to display",
+        available_features,
+        default=['CLOSE'] if available_features else [],
+        key=f"{asset_type.lower()}_features"
+    )
+    
+    if selected_features:
+        # Main prediction plot
+        st.plotly_chart(
+            create_multi_feature_plot(
+                pred_df, predictions,
+                asset_type, selected_features
+            ),
+            use_container_width=True
+        )
+        
+        # Only show correlation and accuracy if we have more than one feature
+        if len(selected_features) > 1:
+            # Correlation and accuracy analysis
+            col1, col2 = st.columns(2)
+            with col1:
+                st.plotly_chart(
+                    create_feature_correlation_plot(pred_df, selected_features),
+                    use_container_width=True
+                )
+            with col2:
+                st.plotly_chart(
+                    create_prediction_accuracy_plot(pred_df, selected_features),
+                    use_container_width=True
+                )
+        
+        # Feature metrics
+        st.subheader("Feature Metrics")
+        cols = st.columns(len(selected_features))
+        for i, feature in enumerate(selected_features):
+            with cols[i]:
+                if f'actual_{feature}' in pred_df.columns:
+                    last_actual = pred_df[f'actual_{feature}'].iloc[-1]
+                    next_pred = predictions[0][i] if i < predictions.shape[1] else None
+                    
+                    if next_pred is not None:
+                        change = ((next_pred - last_actual) / last_actual) * 100
+                        
+                        if asset_type == "Forex":
+                            st.metric(
+                                f"{feature}",
+                                f"{next_pred:.4f}",
+                                f"{change:+.2f}%"
+                            )
+                        else:
+                            st.metric(
+                                f"{feature}",
+                                f"${next_pred:.2f}",
+                                f"{change:+.2f}%"
+                            )
+
 def main():
-    st.title("📈 Financial Forecasting Dashboard")
+    st.title("📈 Advanced Financial Forecasting Dashboard")
     st.markdown("---")
 
     # Load models and scalers
@@ -135,99 +280,60 @@ def main():
         st.error("Failed to load models or scalers. Please check the error messages above.")
         return
 
-    # Create tabs for different asset types
-    tabs = st.tabs(["Stocks", "Cryptocurrency", "Forex"])
-
     # Load historical predictions
     stock_pred = load_predictions("stock")
     crypto_pred = load_predictions("crypto")
     forex_pred = load_predictions("forex")
 
+    # Create tabs for different asset types
+    tabs = st.tabs(["Stocks", "Cryptocurrency", "Forex"])
+
     # Generate future predictions
     with st.spinner("Generating future predictions..."):
-        # Stocks
-        stock_last_sequence = stock_scaler.transform(
-            stock_pred['actual'].values[-50:].reshape(-1, 1)
-        )
-        stock_future = predict_future(stock_model, stock_last_sequence, stock_scaler)
+        predictions = {}
+        for asset_type, pred_df, model, scaler in [
+            ("stock", stock_pred, stock_model, stock_scaler),
+            ("crypto", crypto_pred, crypto_model, crypto_scaler),
+            ("forex", forex_pred, forex_model, forex_scaler)
+        ]:
+            if pred_df is not None:
+                available_features = get_available_features(pred_df)
+                if available_features:
+                    last_sequence = np.column_stack([
+                        pred_df[f'actual_{feature}'].values[-50:] 
+                        for feature in available_features
+                    ])
+                    scaled_sequence = scaler.transform(last_sequence)
+                    predictions[asset_type] = predict_future(model, scaled_sequence, scaler)
+                else:
+                    predictions[asset_type] = None
+            else:
+                predictions[asset_type] = None
 
-        # Crypto
-        crypto_last_sequence = crypto_scaler.transform(
-            crypto_pred['actual'].values[-50:].reshape(-1, 1)
-        )
-        crypto_future = predict_future(crypto_model, crypto_last_sequence, crypto_scaler)
-
-        # Forex
-        forex_last_sequence = forex_scaler.transform(
-            forex_pred['actual'].values[-50:].reshape(-1, 1)
-        )
-        forex_future = predict_future(forex_model, forex_last_sequence, forex_scaler)
-
-    # Stock Tab
+    # Display analysis for each asset type
     with tabs[0]:
-        st.header("Stock Market Forecast")
-        st.plotly_chart(
-            create_forecast_plot(stock_pred, stock_future, "Stock"),
-            use_container_width=True
-        )
-        
-        # Display metrics
-        col1, col2, col3 = st.columns(3)
-        with col1:
-            last_actual = stock_pred['actual'].iloc[-1]
-            st.metric("Latest Actual Price", f"${last_actual:.2f}")
-        with col2:
-            next_pred = stock_future[0]
-            change = ((next_pred - last_actual) / last_actual) * 100
-            st.metric("Next Day Forecast", f"${next_pred:.2f}", f"{change:+.2f}%")
-        with col3:
-            forecast_30d = stock_future[-1]
-            change_30d = ((forecast_30d - last_actual) / last_actual) * 100
-            st.metric("30-Day Forecast", f"${forecast_30d:.2f}", f"{change_30d:+.2f}%")
+        st.header("Stock Market Analysis")
+        if stock_pred is not None and predictions.get('stock') is not None:
+            display_asset_analysis(tabs[0], stock_pred, predictions['stock'], "Stock", 
+                                 get_available_features(stock_pred))
+        else:
+            st.error("Stock data not available")
 
-    # Crypto Tab
     with tabs[1]:
-        st.header("Cryptocurrency Forecast")
-        st.plotly_chart(
-            create_forecast_plot(crypto_pred, crypto_future, "Cryptocurrency"),
-            use_container_width=True
-        )
-        
-        # Display metrics
-        col1, col2, col3 = st.columns(3)
-        with col1:
-            last_actual = crypto_pred['actual'].iloc[-1]
-            st.metric("Latest Actual Price", f"${last_actual:.2f}")
-        with col2:
-            next_pred = crypto_future[0]
-            change = ((next_pred - last_actual) / last_actual) * 100
-            st.metric("Next Day Forecast", f"${next_pred:.2f}", f"{change:+.2f}%")
-        with col3:
-            forecast_30d = crypto_future[-1]
-            change_30d = ((forecast_30d - last_actual) / last_actual) * 100
-            st.metric("30-Day Forecast", f"${forecast_30d:.2f}", f"{change_30d:+.2f}%")
+        st.header("Cryptocurrency Analysis")
+        if crypto_pred is not None and predictions.get('crypto') is not None:
+            display_asset_analysis(tabs[1], crypto_pred, predictions['crypto'], "Cryptocurrency", 
+                                 get_available_features(crypto_pred))
+        else:
+            st.error("Cryptocurrency data not available")
 
-    # Forex Tab
     with tabs[2]:
-        st.header("Forex Forecast")
-        st.plotly_chart(
-            create_forecast_plot(forex_pred, forex_future, "Forex"),
-            use_container_width=True
-        )
-        
-        # Display metrics
-        col1, col2, col3 = st.columns(3)
-        with col1:
-            last_actual = forex_pred['actual'].iloc[-1]
-            st.metric("Latest Actual Rate", f"{last_actual:.4f}")
-        with col2:
-            next_pred = forex_future[0]
-            change = ((next_pred - last_actual) / last_actual) * 100
-            st.metric("Next Day Forecast", f"{next_pred:.4f}", f"{change:+.2f}%")
-        with col3:
-            forecast_30d = forex_future[-1]
-            change_30d = ((forecast_30d - last_actual) / last_actual) * 100
-            st.metric("30-Day Forecast", f"{forecast_30d:.4f}", f"{change_30d:+.2f}%")
+        st.header("Forex Analysis")
+        if forex_pred is not None and predictions.get('forex') is not None:
+            display_asset_analysis(tabs[2], forex_pred, predictions['forex'], "Forex", 
+                                 get_available_features(forex_pred))
+        else:
+            st.error("Forex data not available")
 
 if __name__ == "__main__":
     main()
